@@ -1,0 +1,150 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+generate_employee_data <- function(n = 1500) {
+  set.seed(123)
+  df <- data.frame(
+    employee_id = 1:n,
+    level_group = sample(c("Junior", "Mid", "Senior"), n, replace = TRUE, prob = c(0.4, 0.4, 0.2)),
+    job_function = sample(c("ENG", "G&A", "Product"), n, replace = TRUE),
+    tenure_months = sample(1:60, n, replace = TRUE)
+  )
+  base_rate <- ifelse(df$level_group == "Junior", 0.05, ifelse(df$level_group == "Mid", 0.03, 0.015))
+  df$time_to_term <- rexp(n, rate = base_rate)
+  df$is_termed <- ifelse(df$time_to_term <= df$tenure_months, 1, 0)
+  df$observed_time <- pmin(df$tenure_months, df$time_to_term)
+  df
+}
+
+emp_data = generate_employee_data()
+```
+
+
+```{r}
+fit_attrition_model <- function(df) {
+  coxph(Surv(observed_time, is_termed) ~ level_group + job_function, data = df)
+}
+```
+
+
+```{r}
+library(survival)
+library(dplyr)
+library(tidyr)
+
+generate_candidate_data <- function(n = 2000) {
+  set.seed(42)
+  level_group <- sample(c("Junior", "Mid", "Senior"), n, replace = TRUE, prob = c(0.5, 0.3, 0.2))
+  job_function <- sample(c("ENG", "G&A", "Product"), n, replace = TRUE)
+  
+  hire_rate <- ifelse(level_group == "Junior", 0.3,
+                      ifelse(level_group == "Mid", 0.15, 0.08))
+  
+  time_to_hire <- rexp(n, rate = hire_rate)
+  is_hired <- rbinom(n, 1, prob = 0.10)  # only 10% hired
+  max_observed <- 12  # censor others at 12 months
+  observed_time <- pmin(time_to_hire, max_observed)
+
+  data.frame(
+    candidate_id = 1:n,
+    level_group,
+    job_function,
+    time_to_hire,
+    is_hired,
+    observed_time
+  )
+}
+
+fit_hiring_model <- function(candidate_data) {
+  survival::coxph(Surv(observed_time, is_hired) ~ level_group + job_function, data = candidate_data)
+}
+
+```
+
+```{r}
+initial_df <- emp_data %>%
+      group_by(level_group, job_function) %>%
+      summarise(headcount = n(), .groups = "drop")
+
+attr_model = fit_attrition_model(emp_data)
+cand_data = generate_candidate_data()
+hire_model = fit_hiring_model(cand_data)
+hires <- list(Junior = 10, Mid = 5, Senior = 3)
+
+
+attr_sf <- survfit(attr_model, 
+                       newdata = data.frame(level_group = "Junior", job_function = "ENG"))
+attr_probs <- approx(attr_sf$time, attr_sf$surv, xout = 0:months, rule = 2)$y
+
+s1 <- summary(attr_sf, times = 6)$surv
+s2 <- summary(attr_sf, times = 12)$surv
+init <- initial_df %>%
+      filter(level_group == "Junior", job_function == job_function) %>%
+      summarise(headcount = sum(headcount), .groups = "drop") %>%
+      pull(headcount)
+mat <- matrix(NA, nrow = runs, ncol = months + 1)
+mat[, 1] <- init
+```
+
+```{r}
+simulate_headcount <- function(initial_df, n_hires, attr_model, hire_model, 
+                               job_function, months = 24, runs = 100) {
+  levels <- names(n_hires)
+  results <- list()
+  for (lvl in levels) {
+    attr_sf <- survfit(attr_model, 
+                       newdata = data.frame(level_group = lvl, job_function = job_function))
+    
+    hire_sf <- survfit(hire_model, newdata = data.frame(level_group = lvl, job_function = job_function))
+    
+    init <- initial_df %>%
+      filter(level_group == lvl, job_function == job_function) %>%
+      summarise(headcount = sum(headcount), .groups = "drop") %>%
+      pull(headcount)
+    
+    if (length(init) == 0) init <- 0
+    
+    mat <- matrix(NA, nrow = runs, ncol = months + 1)
+    mat[, 1] <- init
+    attr_surv <- approx(attr_sf$time, attr_sf$surv, xout = 0:months, rule = 2)$y
+    hire_cdf  <- 1 - approx(hire_sf$time, hire_sf$surv, xout = 0:months, rule = 2)$y
+    
+    
+    for (t in 2:(months + 1)) {
+      prev <- mat[, t - 1]
+      prob_attr <- attr_surv[t - 1] - attr_surv[t]
+      attrit <- rbinom(runs, size = prev, prob = prob_attr)
+      
+      # Prob of being hired in month t
+      prob_hires <- hire_cdf[t] - hire_cdf[t - 1]
+      hire_fill <- rbinom(runs, size = n_hires[[lvl]], prob = prob_hires)
+      
+      mat[, t] <- pmax(0, prev - attrit + hire_fill)
+    }
+    
+    df <- as.data.frame(mat)
+    colnames(df) <- paste0("Month_", 0:months)
+    df$Sim <- 1:runs
+    df$level_group <- lvl
+    results[[lvl]] <- df
+  }
+  bind_rows(results) %>%
+    pivot_longer(cols = starts_with("Month_"), names_to = "Month", names_prefix = "Month_", values_to = "Headcount") %>%
+    mutate(Month = as.integer(Month), Sim = factor(Sim))
+}
+simulate_headcount(initial_df = initial_df, hires, attr_model, hire_model, job_function ="ENG", months =24, runs = 100 )
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
